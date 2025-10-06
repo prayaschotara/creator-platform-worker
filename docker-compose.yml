@@ -1,0 +1,85 @@
+# version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: media_queue_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  media-queue:
+    build: .
+    container_name: media_processing_queue
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      # Redis Configuration
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      
+      # S3/Spaces Configuration
+      - SPACES_ENDPOINT=${DO_SPACES_ENDPOINT}
+      - SPACES_REGION=${DO_SPACES_REGION}
+      - SPACES_ACCESS_KEY=${DO_SPACES_KEY}
+      - SPACES_SECRET_KEY=${DO_SPACES_SECRET}
+      - SPACES_BUCKET=${DO_SPACES_BUCKET}
+      
+      # Worker Configuration
+      - WORKER_CONCURRENCY=3
+      - LOG_LEVEL=info
+      - PORT=3001
+      
+      # Processing Configuration
+      - HLS_SEGMENT_DURATION=${HLS_SEGMENT_DURATION}
+      - THUMBNAIL_COUNT=3
+      - PROCESSING_TIMEOUT=${PROCESSING_TIMEOUT}
+
+      # Primary Server Configuration
+      - PRIMARY_SERVER_URL=${PRIMARY_SERVER_URL}
+      
+      # Health and monitoring
+    volumes:
+      - ./logs:/usr/src/app/logs
+      - /tmp/processing:/tmp/processing
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Redis Commander for queue monitoring
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: redis_commander
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    depends_on:
+      - redis
+    profiles:
+      - monitoring
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  default:
+    name: media_processing_network
