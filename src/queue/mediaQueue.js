@@ -40,6 +40,36 @@ const mediaQueue = new Worker('media-processing', async (job) => {
     });
 
     try {
+
+        let progress = 30; // Start from 30% (frontend handles 0-30%)
+        const progressIncrement = 70 / (media.length * 3); // Divide remaining 70% among media and steps
+
+        const updateProgress = async (message, extraProgress = 0) => {
+            progress = Math.min(95, progress + extraProgress); // Cap at 95% until final completion
+
+            await job.updateProgress({
+                percentage: Math.round(progress),
+                message: message,
+                postId: postId,
+                timestamp: new Date().toISOString()
+            });
+
+            if (callbackUrl) {
+                try {
+                    const { notifyPrimaryServer } = require('../app');
+                    await notifyPrimaryServer(callbackUrl, {
+                        postId,
+                        progress: Math.round(progress),
+                        message: message,
+                        status: 'processing',
+                        type: 'progress'
+                    });
+                } catch (notifyError) {
+                    logger.warn('Failed to notify progress:', notifyError.message);
+                }
+            }
+        };
+
         // Process all media items in the job
         const processedMediaResults = [];
         await fs.mkdir(CONFIG.DOWNLOAD_DIR, { recursive: true });
@@ -47,8 +77,12 @@ const mediaQueue = new Worker('media-processing', async (job) => {
         const localOutputPath = path.join(CONFIG.OUTPUT_DIR, postId);
         const localDownloadPath = path.join(CONFIG.DOWNLOAD_DIR, postId);
 
-        for (const mediaItem of media) {
+        await updateProgress('Starting media processing...');
+
+        for (const [index, mediaItem] of media.entries()) {
             const { id: mediaId, type: mediaType, filename, originalName, height } = mediaItem;
+
+            await updateProgress(`Processing ${index + 1}/${media.length}: ${filename}`);
 
             // Create a clean directory for each media item
             const mediaOutputPath = path.join(localOutputPath, mediaId);
@@ -72,6 +106,8 @@ const mediaQueue = new Worker('media-processing', async (job) => {
 
             const signedUrl = (await s3Client.getSignedUrlForRead(mediaJobData.s3Key)).toString();
             await s3Client.downloadFromUrl(signedUrl, localDownloadPath);
+            await updateProgress(`Downloaded ${filename}`, progressIncrement);
+
             logger.info(`Processing individual media item`, {
                 jobId: job.id,
                 mediaId,
@@ -80,6 +116,7 @@ const mediaQueue = new Worker('media-processing', async (job) => {
             });
 
             if (mediaType === 'VIDEO') {
+                await updateProgress(`Transcoding video: ${filename}`);
                 const result = await videoProcessor.processVideo(
                     localDownloadPath,
                     mediaOutputPath,
@@ -92,6 +129,7 @@ const mediaQueue = new Worker('media-processing', async (job) => {
                 if (result) {
                     processedMediaResults.push(result);
                 }
+                await updateProgress(`Video transcoding completed: ${filename}`, progressIncrement * 2);
             } else if (mediaType === 'IMAGE') {
                 const result = await imageProcessor.processImage(
                     localDownloadPath,
@@ -104,11 +142,14 @@ const mediaQueue = new Worker('media-processing', async (job) => {
                 if (result) {
                     processedMediaResults.push(result);
                 }
+                await updateProgress(`Image processing completed: ${filename}`, progressIncrement * 2);
             }
         }
+        await updateProgress('Uploading processed files...');
         // Clean up local files
         await fs.rm(localOutputPath, { recursive: true, force: true });
         await fs.rm(localDownloadPath, { recursive: true, force: true });
+        await updateProgress('Finalizing...', 5); // Final 5%
         // Notify primary server with ALL results at once
         if (callbackUrl && processedMediaResults.length > 0) {
             const { notifyPrimaryServer } = require('../app');
@@ -116,7 +157,9 @@ const mediaQueue = new Worker('media-processing', async (job) => {
                 postId,
                 mediaResults: processedMediaResults, // Send all media results
                 totalProcessed: processedMediaResults.length,
-                status: 'success'
+                status: 'success',
+                progress: 100,
+                message: 'Media processing completed successfully'
             });
         }
 
@@ -139,6 +182,19 @@ const mediaQueue = new Worker('media-processing', async (job) => {
             stack: error.stack
         });
 
+        // Update progress to indicate failure
+        try {
+            await job.updateProgress({
+                percentage: 100,
+                message: `Processing failed: ${error.message}`,
+                status: 'failed',
+                postId: postId,
+                timestamp: new Date().toISOString()
+            });
+        } catch (progressError) {
+            logger.warn('Failed to update progress on error:', progressError.message);
+        }
+
         // Clean up on error
         try {
             const localOutputPath = path.join(CONFIG.OUTPUT_DIR, postId);
@@ -156,7 +212,9 @@ const mediaQueue = new Worker('media-processing', async (job) => {
                 await notifyPrimaryServer(callbackUrl, {
                     postId,
                     error: error.message,
-                    status: 'failed'
+                    status: 'failed',
+                    progress: 100,
+                    message: `Processing failed: ${error.message}`
                 });
             } catch (notifyError) {
                 logger.error('Failed to notify primary server of error:', notifyError);
