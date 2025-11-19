@@ -61,6 +61,7 @@ const mediaQueue = new Worker('media-processing', async (job) => {
                         postId,
                         progress: Math.round(progress),
                         message: message,
+                        attempt: job.attemptsMade + 1,
                         status: 'processing',
                         type: 'progress'
                     });
@@ -157,6 +158,7 @@ const mediaQueue = new Worker('media-processing', async (job) => {
                 postId,
                 mediaResults: processedMediaResults, // Send all media results
                 totalProcessed: processedMediaResults.length,
+                attempt: job.attemptsMade + 1,
                 status: 'success',
                 progress: 100,
                 message: 'Media processing completed successfully'
@@ -212,6 +214,7 @@ const mediaQueue = new Worker('media-processing', async (job) => {
                 await notifyPrimaryServer(callbackUrl, {
                     postId,
                     error: error.message,
+                    attempt: job.attemptsMade + 1,
                     status: 'failed',
                     progress: 100,
                     message: `Processing failed: ${error.message}`
