@@ -64,7 +64,7 @@ class FFmpegService {
     });
   }
 
-  transcodeSingleRendition(inputPath, outputDir, rendition, filename) {
+  transcodeSingleRendition(inputPath, outputDir, rendition, filename, progressCallback = null) {
     return new Promise((resolve, reject) => {
       const ffmpegArgs = [
         "-i",
@@ -112,6 +112,7 @@ class FFmpegService {
       const ffmpegProcess = spawn("ffmpeg", ffmpegArgs);
 
       let stderrData = "";
+      let duration = null;
 
       ffmpegProcess.stdout.on("data", (data) => {
         logger.info(`FFmpeg stdout (${rendition.name}): ${data}`);
@@ -121,11 +122,32 @@ class FFmpegService {
         stderrData += data.toString();
         // Only log important stderr messages
         const message = data.toString();
-        if (
-          message.includes("frame=") ||
-          message.includes("time=") ||
-          message.includes("speed=")
-        ) {
+        if (!duration && message.includes('Duration:')) {
+          const durationMatch = message.match(/Duration: (\d+):(\d+):(\d+\.\d+)/);
+          if (durationMatch) {
+            const hours = parseInt(durationMatch[1]);
+            const minutes = parseInt(durationMatch[2]);
+            const seconds = parseFloat(durationMatch[3]);
+            duration = hours * 3600 + minutes * 60 + seconds;
+          }
+        }
+
+         // Extract current time and calculate progress
+         if (duration && message.includes('time=')) {
+          const timeMatch = message.match(/time=(\d+):(\d+):(\d+\.\d+)/);
+          if (timeMatch && progressCallback) {
+            const hours = parseInt(timeMatch[1]);
+            const minutes = parseInt(timeMatch[2]);
+            const seconds = parseFloat(timeMatch[3]);
+            const currentTime = hours * 3600 + minutes * 60 + seconds;
+            const progress = Math.min(100, (currentTime / duration) * 100);
+            
+            progressCallback(progress);
+          }
+        }
+
+         // Only log important stderr messages
+         if (message.includes("frame=") || message.includes("time=") || message.includes("speed=")) {
           // Progress messages - you can uncomment if you want to see progress
           // logger.info(`FFmpeg progress (${rendition.name}): ${message.trim()}`);
         } else if (message.includes("error") || message.includes("Error")) {

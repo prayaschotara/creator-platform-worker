@@ -42,7 +42,7 @@ const RENDITIONS = [
     },
 ];
 
-async function processVideo(localFilePath, outputPath, filename, height, mediaId, originalName, s3Key) {
+async function processVideo(localFilePath, outputPath, filename, height, mediaId, originalName, s3Key, progressCallback = null) {
     const targetRenditions = RENDITIONS.filter(
         (r) => r.height <= height
     );
@@ -58,11 +58,24 @@ async function processVideo(localFilePath, outputPath, filename, height, mediaId
         logger.warn(`Failed to generate thumbnail for ${filename}:`, thumbnailError.message);
     }
 
+    const totalRenditions = targetRenditions.length;
+    let completedRenditions = 0;
     // Process video renditions
     for (const rendition of targetRenditions) {
         logger.info(`Starting transcoding for ${rendition.name}`);
-        await FFmpeg.transcodeSingleRendition(localFilePath, outputPath, rendition, filename);
+        await FFmpeg.transcodeSingleRendition(localFilePath, outputPath, rendition, filename, (progress) => {
+            if (progressCallback) {
+                const renditionProgress = (completedRenditions + (progress / 100));
+                const overallVideoProgress = renditionProgress * 100;
+                progressCallback(overallVideoProgress)
+            }
+        });
+        completedRenditions++; 
         logger.info(`Completed transcoding for ${rendition.name}`);
+        if(progressCallback) {
+            const overallVideoProgress = (completedRenditions / totalRenditions) * 100;
+            progressCallback(overallVideoProgress);
+        }
     }
 
     // Create master playlist

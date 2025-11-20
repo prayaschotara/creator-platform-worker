@@ -42,16 +42,26 @@ const mediaQueue = new Worker('media-processing', async (job) => {
     try {
 
         let progress = 30; // Start from 30% (frontend handles 0-30%)
-        const progressIncrement = 70 / (media.length * 3); // Divide remaining 70% among media and steps
+        const totalMedia = media.length
+        const progressPerMedia = 70 / totalMedia; // Divide remaining 70% among media and steps
+        const mediaProgress = new Array(totalMedia).fill(0);
 
-        const updateProgress = async (message, extraProgress = 0) => {
-            progress = Math.min(95, progress + extraProgress); // Cap at 95% until final completion
+        const updateProgress = async (message, extraProgress = 0, mediaIndex = null) => {
+            if (mediaIndex !== null && extraProgress > 0) {
+                // Update specific media progress
+                mediaProgress[mediaIndex] = Math.min(progressPerMedia, mediaProgress[mediaIndex] + extraProgress);
+            }
+
+            const mediaTotalProgress = mediaProgress.reduce((sum, p) => sum + p, 0);
+            progress = Math.min(95, 30 + mediaTotalProgress);
 
             await job.updateProgress({
                 percentage: Math.round(progress),
                 message: message,
                 postId: postId,
-                timestamp: new Date().toISOString()
+                timestamp: new Date().toISOString(),
+                currentMedia: mediaIndex !== null ? mediaIndex + 1 : null,
+                totalMedia: totalMedia
             });
 
             if (callbackUrl) {
@@ -63,7 +73,9 @@ const mediaQueue = new Worker('media-processing', async (job) => {
                         message: message,
                         attempt: job.attemptsMade + 1,
                         status: 'processing',
-                        type: 'progress'
+                        type: 'progress',
+                        currentMedia: mediaIndex !== null ? mediaIndex + 1 : null,
+                        totalMedia: totalMedia
                     });
                 } catch (notifyError) {
                     logger.warn('Failed to notify progress:', notifyError.message);
@@ -83,7 +95,7 @@ const mediaQueue = new Worker('media-processing', async (job) => {
         for (const [index, mediaItem] of media.entries()) {
             const { id: mediaId, type: mediaType, filename, originalName, height } = mediaItem;
 
-            await updateProgress(`Processing ${index + 1}/${media.length}: ${filename}`);
+            await updateProgress(`Processing ${index + 1}/${media.length}: ${filename}`, 0, index);
 
             // Create a clean directory for each media item
             const mediaOutputPath = path.join(localOutputPath, mediaId);
@@ -107,7 +119,7 @@ const mediaQueue = new Worker('media-processing', async (job) => {
 
             const signedUrl = (await s3Client.getSignedUrlForRead(mediaJobData.s3Key)).toString();
             await s3Client.downloadFromUrl(signedUrl, localDownloadPath);
-            await updateProgress(`Downloaded ${filename}`, progressIncrement);
+            await updateProgress(`Downloaded ${filename}`, progressPerMedia * 0.1, index);
 
             logger.info(`Processing individual media item`, {
                 jobId: job.id,
@@ -117,7 +129,14 @@ const mediaQueue = new Worker('media-processing', async (job) => {
             });
 
             if (mediaType === 'VIDEO') {
-                await updateProgress(`Transcoding video: ${filename}`);
+                await updateProgress(`Transcoding video: ${filename}`, 0, index);
+                // Pass progress callback to video processor
+                const videoProgressCallback = (videoProgress) => {
+                    // Video transcoding gets 70% of media progress (from 10% to 80% of media progress)
+                    const videoProgressAmount = (progressPerMedia * 0.7) * (videoProgress / 100);
+                    updateProgress(`Transcoding video: ${filename} (${Math.round(videoProgress)}%)`, videoProgressAmount, index);
+                };
+                
                 const result = await videoProcessor.processVideo(
                     localDownloadPath,
                     mediaOutputPath,
@@ -125,13 +144,16 @@ const mediaQueue = new Worker('media-processing', async (job) => {
                     height,
                     mediaId,
                     originalName,
-                    s3Key
+                    s3Key,
+                    videoProgressCallback
                 );
                 if (result) {
                     processedMediaResults.push(result);
                 }
-                await updateProgress(`Video transcoding completed: ${filename}`, progressIncrement * 2);
+                await updateProgress(`Video transcoding completed: ${filename}`, progressPerMedia * 0.2, index);
             } else if (mediaType === 'IMAGE') {
+                await updateProgress(`Processing image: ${filename}`, 0, index);
+
                 const result = await imageProcessor.processImage(
                     localDownloadPath,
                     mediaOutputPath,
@@ -143,7 +165,7 @@ const mediaQueue = new Worker('media-processing', async (job) => {
                 if (result) {
                     processedMediaResults.push(result);
                 }
-                await updateProgress(`Image processing completed: ${filename}`, progressIncrement * 2);
+                await updateProgress(`Image processing completed: ${filename}`, progressPerMedia * 0.9, index);
             }
         }
         await updateProgress('Uploading processed files...');
