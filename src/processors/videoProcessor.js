@@ -7,6 +7,7 @@ const logger = winston.createLogger({
     format: winston.format.simple(),
     transports: [new winston.transports.Console()]
 });
+
 const RENDITIONS = [
     {
         height: 480,
@@ -49,6 +50,7 @@ async function processVideo(localFilePath, outputPath, filename, height, mediaId
     if (targetRenditions.length === 0) {
         targetRenditions.push(RENDITIONS[0]);
     }
+    
     // Generate thumbnail first
     let thumbnailPath = null;
     try {
@@ -60,19 +62,27 @@ async function processVideo(localFilePath, outputPath, filename, height, mediaId
 
     const totalRenditions = targetRenditions.length;
     let completedRenditions = 0;
+    
     // Process video renditions
     for (const rendition of targetRenditions) {
-        logger.info(`Starting transcoding for ${rendition.name}`);
-        await FFmpeg.transcodeSingleRendition(localFilePath, outputPath, rendition, filename, (progress) => {
+        logger.info(`Starting transcoding for ${rendition.name} (${completedRenditions + 1}/${totalRenditions})`);
+        
+        await FFmpeg.transcodeSingleRendition(localFilePath, outputPath, rendition, filename, (renditionProgress) => {
             if (progressCallback) {
-                const renditionProgress = (completedRenditions + (progress / 100));
-                const overallVideoProgress = renditionProgress * 100;
-                progressCallback(overallVideoProgress)
+                const progressPerRendition = 100 / totalRenditions;
+                const overallVideoProgress = (completedRenditions * progressPerRendition) + 
+                                            (renditionProgress * progressPerRendition / 100);
+                
+                logger.debug(`Rendition ${rendition.name}: ${renditionProgress.toFixed(1)}% | Overall: ${overallVideoProgress.toFixed(1)}%`);
+                progressCallback(overallVideoProgress);
             }
         });
-        completedRenditions++; 
-        logger.info(`Completed transcoding for ${rendition.name}`);
-        if(progressCallback) {
+        
+        completedRenditions++;
+        logger.info(`Completed transcoding for ${rendition.name} (${completedRenditions}/${totalRenditions})`);
+        
+        // Report 100% completion for this rendition
+        if (progressCallback) {
             const overallVideoProgress = (completedRenditions / totalRenditions) * 100;
             progressCallback(overallVideoProgress);
         }

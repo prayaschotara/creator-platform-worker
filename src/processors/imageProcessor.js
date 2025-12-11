@@ -1,19 +1,30 @@
-/* eslint-disable esm/no-commonjs */
-const FFmpeg = require("../utils/ffmpeg")
-const mediaUploader = require("../utils/mediaUploader")
+const FFmpeg = require("../utils/ffmpeg");
+const mediaUploader = require("../utils/mediaUploader");
 const axios = require('axios');
 const path = require("path");
 const fs = require("fs/promises");
 
-async function processImage(localFilePath, outputPath, filename, mediaId, originalName, s3Key) {
+async function processImage(
+    localFilePath, 
+    outputPath, 
+    filename, 
+    mediaId, 
+    originalName, 
+    s3Key,
+    progressCallback = null
+) {
     let processedImagePath = null;
     let blurredThumbnailPath = null;
 
-    // await helper.downloadOriginalFile(localFilePath, outputPath, filename);
-
     try {
+        // Report initial progress
+        if (progressCallback) progressCallback(10); // Starting processing
+        
         // Process the main image (resize if needed)
         processedImagePath = await FFmpeg.transcodeImage(localFilePath, outputPath, filename);
+        
+        if (progressCallback) progressCallback(50); // Image processed
+        
     } catch (imageError) {
         console.error(`Failed to process image ${filename}:`, imageError.message);
         throw imageError;
@@ -22,20 +33,27 @@ async function processImage(localFilePath, outputPath, filename, mediaId, origin
     try {
         // Generate blurred thumbnail
         blurredThumbnailPath = await FFmpeg.generateBlurredThumbnail(localFilePath, outputPath, filename);
+        
+        if (progressCallback) progressCallback(70); // Thumbnail generated
+        
     } catch (blurredError) {
         console.warn(`Failed to generate blurred thumbnail for ${filename}:`, blurredError.message);
     }
     
-    // Copy the local file to output directory instead of downloading from URL
+    // Copy the local file to output directory
     const originalFilePath = path.join(outputPath, filename);
     await fs.copyFile(localFilePath, originalFilePath);
 
+    if (progressCallback) progressCallback(80); // Files ready for upload
 
     // Upload processed files
     const uploadedFiles = await mediaUploader.uploadDirectory(
         outputPath,
         `creator-platform-bucket/${s3Key}processed`
     );
+    
+    if (progressCallback) progressCallback(100); // Upload complete
+    
     // Find processed image URL
     const processedImageFile = uploadedFiles.find(file =>
         file.originalName.includes('_processed')
@@ -51,7 +69,7 @@ async function processImage(localFilePath, outputPath, filename, mediaId, origin
     );
 
     // Store result for this image media item
-    return{
+    return {
         mediaId,
         originalName,
         filename,

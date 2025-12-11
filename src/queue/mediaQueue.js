@@ -43,12 +43,12 @@ const mediaQueue = new Worker('media-processing', async (job) => {
     try {
         // Get the maximum progress ever reached (persists across retries)
         const maxProgress = await progressTracker.getMaxProgress(postId);
-        
+
         let progress = Math.max(30, maxProgress); // Start from max progress or 30% minimum
         const totalMedia = media.length
         const progressPerMedia = 70 / totalMedia; // Divide remaining 70% among media and steps
         const mediaProgress = new Array(totalMedia).fill(0);
-        
+
         logger.info(`Starting job for post ${postId}, maximum progress: ${maxProgress}%, current attempt: ${job.attemptsMade + 1}`);
 
         const updateProgress = async (message, extraProgress = 0, mediaIndex = null) => {
@@ -58,11 +58,12 @@ const mediaQueue = new Worker('media-processing', async (job) => {
             }
 
             const mediaTotalProgress = mediaProgress.reduce((sum, p) => sum + p, 0);
-            const calculatedProgress = Math.min(95, 30 + mediaTotalProgress);
-            
+            // CHANGED: Remove the Math.min(95, ...) cap - let it go to 100 naturally
+            const calculatedProgress = 30 + mediaTotalProgress;
+
             // Get current maximum progress
             const currentMaxProgress = await progressTracker.getMaxProgress(postId);
-            
+
             // Only update progress if it exceeds the maximum ever reached
             // This prevents progress from going backwards on retries
             if (calculatedProgress > currentMaxProgress) {
@@ -75,7 +76,6 @@ const mediaQueue = new Worker('media-processing', async (job) => {
                 progress = currentMaxProgress;
                 logger.debug(`Progress stayed at ${progress}% (calculated: ${calculatedProgress}%, max: ${currentMaxProgress}%)`);
             }
-
             await job.updateProgress({
                 percentage: Math.round(progress),
                 message: message,
@@ -120,7 +120,7 @@ const mediaQueue = new Worker('media-processing', async (job) => {
         // Restore progress for already completed media items
         const existingProgress = await progressTracker.getProgress(postId);
         const completedMediaIds = await progressTracker.getCompletedMedia(postId);
-        
+
         // Restore media progress based on completed items
         let completedCount = 0;
         for (let i = 0; i < media.length; i++) {
@@ -129,23 +129,23 @@ const mediaQueue = new Worker('media-processing', async (job) => {
                 completedCount++;
             }
         }
-        
+
         if (completedCount > 0) {
             const restoredProgress = 30 + (mediaProgress.reduce((sum, p) => sum + p, 0));
             progress = Math.max(progress, restoredProgress);
             logger.info(`Restored ${completedCount} completed media items for post ${postId}, progress: ${progress}%`);
         }
-        
+
         // Ensure we start from the maximum progress ever reached
         const finalMaxProgress = await progressTracker.getMaxProgress(postId);
         if (finalMaxProgress > progress) {
             progress = finalMaxProgress;
             logger.info(`Starting from maximum progress: ${finalMaxProgress}% for post ${postId}`);
         }
-        
+
         // Process all media items in the job
         const processedMediaResults = new Array(totalMedia).fill(null);
-        
+
         // Restore results from previously completed media items in correct order
         const existingResults = await progressTracker.getAllMediaResults(postId);
         const resultMap = new Map(existingResults.map(r => [r.mediaId, r]));
@@ -155,7 +155,7 @@ const mediaQueue = new Worker('media-processing', async (job) => {
                 processedMediaResults[i] = result;
             }
         }
-        
+
         await fs.mkdir(CONFIG.DOWNLOAD_DIR, { recursive: true });
         await fs.mkdir(CONFIG.OUTPUT_DIR, { recursive: true });
         const localOutputPath = path.join(CONFIG.OUTPUT_DIR, postId);
@@ -170,7 +170,6 @@ const mediaQueue = new Worker('media-processing', async (job) => {
             const isCompleted = await progressTracker.isMediaCompleted(postId, mediaId);
             if (isCompleted) {
                 logger.info(`Skipping already completed media: ${mediaId} (${filename})`);
-                // Progress for this media item is already restored, just log the skip
                 await updateProgress(`Skipping already completed: ${filename}`, 0, index);
                 continue;
             }
@@ -199,7 +198,8 @@ const mediaQueue = new Worker('media-processing', async (job) => {
 
             const signedUrl = (await s3Client.getSignedUrlForRead(mediaJobData.s3Key)).toString();
             await s3Client.downloadFromUrl(signedUrl, localDownloadPath);
-            await updateProgress(`Downloaded ${filename}`, progressPerMedia * 0.1, index);
+            mediaProgress[index] = 0.1 * progressPerMedia;
+            await updateProgress(`Downloaded ${filename}`, 0, index);
 
             logger.info(`Processing individual media item`, {
                 jobId: job.id,
@@ -210,13 +210,63 @@ const mediaQueue = new Worker('media-processing', async (job) => {
 
             if (mediaType === 'VIDEO') {
                 await updateProgress(`Transcoding video: ${filename}`, 0, index);
+
                 // Pass progress callback to video processor
                 const videoProgressCallback = (videoProgress) => {
-                    // Video transcoding gets 70% of media progress (from 10% to 80% of media progress)
-                    const videoProgressAmount = (progressPerMedia * 0.7) * (videoProgress / 100);
-                    updateProgress(`Transcoding video: ${filename} (${Math.round(videoProgress)}%)`, videoProgressAmount, index);
+                    const downloadComplete = 0.1 * progressPerMedia; // 10% already done
+                    const videoPortionOfMedia = 0.8 * progressPerMedia; // 80% for video
+                    const currentVideoProgress = (videoProgress / 100) * videoPortionOfMedia;
+
+                    // Set this media's progress (not add to it)
+                    mediaProgress[index] = downloadComplete + currentVideoProgress;
+
+                    // Calculate total progress across all media
+                    const mediaTotalProgress = mediaProgress.reduce((sum, p) => sum + p, 0);
+                    const calculatedProgress = 30 + mediaTotalProgress;
+
+                    console.log(`Video ${index + 1}/${media.length}: ${videoProgress.toFixed(1)}% -> Overall: ${calculatedProgress.toFixed(1)}%`);
+
+                    // Update progress tracking (async)
+                    (async () => {
+                        try {
+                            const currentMax = await progressTracker.getMaxProgress(postId);
+                            if (calculatedProgress > currentMax) {
+                                await progressTracker.setMaxProgress(postId, calculatedProgress);
+                                progress = calculatedProgress;
+                            } else {
+                                progress = currentMax;
+                            }
+
+                            // Update job progress
+                            await job.updateProgress({
+                                percentage: Math.round(progress),
+                                message: `Transcoding video: ${filename} (${Math.round(videoProgress)}%)`,
+                                postId: postId,
+                                timestamp: new Date().toISOString(),
+                                currentMedia: index + 1,
+                                totalMedia: totalMedia
+                            });
+
+                            // Notify primary server
+                            if (callbackUrl) {
+                                const { notifyPrimaryServer } = require('../app');
+                                await notifyPrimaryServer(callbackUrl, {
+                                    postId,
+                                    progress: Math.round(progress),
+                                    message: `Transcoding video: ${filename} (${Math.round(videoProgress)}%)`,
+                                    attempt: job.attemptsMade + 1,
+                                    status: 'processing',
+                                    type: 'progress',
+                                    currentMedia: index + 1,
+                                    totalMedia: totalMedia
+                                });
+                            }
+                        } catch (err) {
+                            logger.warn('Failed to update progress during video transcoding:', err.message);
+                        }
+                    })();
                 };
-                
+
                 const result = await videoProcessor.processVideo(
                     localDownloadPath,
                     mediaOutputPath,
@@ -227,15 +277,73 @@ const mediaQueue = new Worker('media-processing', async (job) => {
                     s3Key,
                     videoProgressCallback
                 );
+
                 if (result) {
                     processedMediaResults[index] = result;
-                    // Mark media as completed and store result for retry resilience
                     await progressTracker.markMediaCompleted(postId, mediaId);
                     await progressTracker.setMediaResult(postId, mediaId, result);
                 }
-                await updateProgress(`Video transcoding completed: ${filename}`, progressPerMedia * 0.2, index);
+
+                // Set to 100% of this media's allocated progress (includes the final 10%)
+                mediaProgress[index] = progressPerMedia;
+                await updateProgress(`Video transcoding completed: ${filename}`, 0, index);
+
             } else if (mediaType === 'IMAGE') {
                 await updateProgress(`Processing image: ${filename}`, 0, index);
+
+                // Pass progress callback to image processor
+                const imageProgressCallback = (imageProgress) => {
+                    const downloadComplete = 0.1 * progressPerMedia;
+                    const imagePortionOfMedia = 0.8 * progressPerMedia;
+                    const currentImageProgress = (imageProgress / 100) * imagePortionOfMedia;
+
+                    // Set this media's progress
+                    mediaProgress[index] = downloadComplete + currentImageProgress;
+
+                    // Calculate total progress
+                    const mediaTotalProgress = mediaProgress.reduce((sum, p) => sum + p, 0);
+                    const calculatedProgress = 30 + mediaTotalProgress;
+
+                    console.log(`Image ${index + 1}/${media.length}: ${imageProgress.toFixed(1)}% -> Overall: ${calculatedProgress.toFixed(1)}%`);
+
+                    // Update progress tracking (async)
+                    (async () => {
+                        try {
+                            const currentMax = await progressTracker.getMaxProgress(postId);
+                            if (calculatedProgress > currentMax) {
+                                await progressTracker.setMaxProgress(postId, calculatedProgress);
+                                progress = calculatedProgress;
+                            } else {
+                                progress = currentMax;
+                            }
+
+                            await job.updateProgress({
+                                percentage: Math.round(progress),
+                                message: `Processing image: ${filename} (${Math.round(imageProgress)}%)`,
+                                postId: postId,
+                                timestamp: new Date().toISOString(),
+                                currentMedia: index + 1,
+                                totalMedia: totalMedia
+                            });
+
+                            if (callbackUrl) {
+                                const { notifyPrimaryServer } = require('../app');
+                                await notifyPrimaryServer(callbackUrl, {
+                                    postId,
+                                    progress: Math.round(progress),
+                                    message: `Processing image: ${filename} (${Math.round(imageProgress)}%)`,
+                                    attempt: job.attemptsMade + 1,
+                                    status: 'processing',
+                                    type: 'progress',
+                                    currentMedia: index + 1,
+                                    totalMedia: totalMedia
+                                });
+                            }
+                        } catch (err) {
+                            logger.warn('Failed to update progress during image processing:', err.message);
+                        }
+                    })();
+                };
 
                 const result = await imageProcessor.processImage(
                     localDownloadPath,
@@ -243,30 +351,44 @@ const mediaQueue = new Worker('media-processing', async (job) => {
                     filename,
                     mediaId,
                     originalName,
-                    s3Key
+                    s3Key,
+                    imageProgressCallback
                 );
+
                 if (result) {
                     processedMediaResults[index] = result;
-                    // Mark media as completed and store result for retry resilience
                     await progressTracker.markMediaCompleted(postId, mediaId);
                     await progressTracker.setMediaResult(postId, mediaId, result);
                 }
-                await updateProgress(`Image processing completed: ${filename}`, progressPerMedia * 0.9, index);
+
+                // Set to 100% of this media's allocated progress
+                mediaProgress[index] = progressPerMedia;
+                await updateProgress(`Image processing completed: ${filename}`, 0, index);
             }
         }
+        // After the loop, before cleanup:
         await updateProgress('Uploading processed files...');
+
         // Clean up local files
         await fs.rm(localOutputPath, { recursive: true, force: true });
         await fs.rm(localDownloadPath, { recursive: true, force: true });
-        await updateProgress('Finalizing...', 5); // Final 5%
-        
+
+        // Final progress update
+        mediaProgress.fill(progressPerMedia); // Ensure all media are at 100%
+        const finalMediaProgress = mediaProgress.reduce((sum, p) => sum + p, 0);
+        const finalCalculatedProgress = Math.min(95, 30 + finalMediaProgress);
+        await progressTracker.setMaxProgress(postId, finalCalculatedProgress);
+        progress = finalCalculatedProgress;
+
+        await updateProgress('Finalizing...', 5); // Final 5% to reach 100%
+
         // Set progress to 100% on successful completion
         await progressTracker.setMaxProgress(postId, 100);
         progress = 100;
-        
+
         // Filter out null values (media items that weren't processed)
         const validResults = processedMediaResults.filter(r => r !== null);
-        
+
         // Notify primary server with ALL results at once
         if (callbackUrl && validResults.length > 0) {
             const { notifyPrimaryServer } = require('../app');
